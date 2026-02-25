@@ -34,6 +34,20 @@ type SyncInfo = {
   syncMode: "full" | "incremental";
 };
 
+type ProviderDnsRecord = {
+  id: string;
+  type: string;
+  name: string;
+  value: string;
+  ttl: number | null;
+};
+
+type ProviderDomainSnapshot = {
+  domain: string;
+  info: Record<string, unknown>;
+  dnsRecords: ProviderDnsRecord[];
+};
+
 function getErrorDetails(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -153,6 +167,12 @@ export default function IntranetPage() {
   const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
   const [analytics, setAnalytics] = useState<DashboardAnalytics | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
+  const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
+  const [providerLoading, setProviderLoading] = useState(false);
+  const [providerError, setProviderError] = useState<string | null>(null);
+  const [providerData, setProviderData] = useState<ProviderDomainSnapshot | null>(null);
+  const [dnsForm, setDnsForm] = useState({ type: "A", name: "@", value: "", ttl: "3600" });
+  const [dnsSaving, setDnsSaving] = useState(false);
 
   const tldOptions = useMemo(() => {
     const set = new Set<string>();
@@ -276,6 +296,121 @@ export default function IntranetPage() {
       setDomainsError(getErrorDetails(error));
     }
   }, [loadDomains, loadSyncInfo]);
+
+  const openDomainManager = useCallback(async (domain: string) => {
+    setSelectedDomain(domain);
+    setProviderLoading(true);
+    setProviderError(null);
+    try {
+      const response = await fetch(`/api/provider/domain?domain=${encodeURIComponent(domain)}`);
+      const payload = (await response.json()) as ProviderDomainSnapshot & { error?: string; details?: string };
+      if (!response.ok) {
+        throw new Error(payload.details || payload.error || "No se pudo cargar el dominio en el proveedor");
+      }
+      setProviderData(payload);
+    } catch (error: unknown) {
+      setProviderData(null);
+      setProviderError(getErrorDetails(error));
+    } finally {
+      setProviderLoading(false);
+    }
+  }, []);
+
+  const refreshProviderDns = useCallback(async () => {
+    if (!selectedDomain) return;
+    setProviderLoading(true);
+    setProviderError(null);
+    try {
+      const response = await fetch(`/api/provider/domain/dns?domain=${encodeURIComponent(selectedDomain)}`);
+      const payload = (await response.json()) as { records?: ProviderDnsRecord[]; error?: string; details?: string };
+      if (!response.ok) throw new Error(payload.details || payload.error || "No se pudo refrescar DNS");
+      setProviderData((prev) =>
+        prev
+          ? {
+              ...prev,
+              dnsRecords: payload.records || [],
+            }
+          : null
+      );
+    } catch (error: unknown) {
+      setProviderError(getErrorDetails(error));
+    } finally {
+      setProviderLoading(false);
+    }
+  }, [selectedDomain]);
+
+  const createDnsRecord = useCallback(async () => {
+    if (!selectedDomain) return;
+    if (!dnsForm.value.trim()) {
+      setProviderError("El campo Target/Value es obligatorio.");
+      return;
+    }
+
+    setDnsSaving(true);
+    setProviderError(null);
+    try {
+      const ttlValue = Number(dnsForm.ttl);
+      const response = await fetch("/api/provider/domain/dns", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          domain: selectedDomain,
+          type: dnsForm.type,
+          name: dnsForm.name || "@",
+          value: dnsForm.value,
+          ttl: Number.isFinite(ttlValue) ? ttlValue : null,
+        }),
+      });
+      const payload = (await response.json()) as { records?: ProviderDnsRecord[]; error?: string; details?: string };
+      if (!response.ok) throw new Error(payload.details || payload.error || "No se pudo crear el registro DNS");
+      setProviderData((prev) =>
+        prev
+          ? {
+              ...prev,
+              dnsRecords: payload.records || [],
+            }
+          : null
+      );
+      setDnsForm((prev) => ({ ...prev, value: "" }));
+    } catch (error: unknown) {
+      setProviderError(getErrorDetails(error));
+    } finally {
+      setDnsSaving(false);
+    }
+  }, [dnsForm, selectedDomain]);
+
+  const deleteDnsRecord = useCallback(
+    async (recordId: string) => {
+      if (!selectedDomain) return;
+      setDnsSaving(true);
+      setProviderError(null);
+      try {
+        const response = await fetch("/api/provider/domain/dns", {
+          method: "DELETE",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            domain: selectedDomain,
+            recordId,
+          }),
+        });
+        const payload = (await response.json()) as { records?: ProviderDnsRecord[]; error?: string; details?: string };
+        if (!response.ok) throw new Error(payload.details || payload.error || "No se pudo eliminar el registro DNS");
+        setProviderData((prev) =>
+          prev
+            ? {
+                ...prev,
+                dnsRecords: payload.records || [],
+              }
+            : null
+        );
+      } catch (error: unknown) {
+        setProviderError(getErrorDetails(error));
+      } finally {
+        setDnsSaving(false);
+      }
+    },
+    [selectedDomain]
+  );
 
   const setSort = useCallback((field: string, dir: "asc" | "desc") => {
     setPage(1);
@@ -489,24 +624,33 @@ export default function IntranetPage() {
                         </td>
                       ))}
                       <td className={`px-3 ${expanded ? "py-3" : "py-2"} align-top`}>
-                        {canExpand ? (
+                        <div className="flex flex-wrap gap-2">
+                          {canExpand ? (
+                            <button
+                              type="button"
+                              onClick={() =>
+                                setExpandedRows((prev) => {
+                                  const next = new Set(prev);
+                                  if (next.has(item.domain)) next.delete(item.domain);
+                                  else next.add(item.domain);
+                                  return next;
+                                })
+                              }
+                              className="rounded border border-neutral-300 px-2 py-1 text-xs hover:bg-neutral-100"
+                            >
+                              {expanded ? "Ver menos" : "Ver más"}
+                            </button>
+                          ) : (
+                            <span className="text-xs text-neutral-400">-</span>
+                          )}
                           <button
                             type="button"
-                            onClick={() =>
-                              setExpandedRows((prev) => {
-                                const next = new Set(prev);
-                                if (next.has(item.domain)) next.delete(item.domain);
-                                else next.add(item.domain);
-                                return next;
-                              })
-                            }
+                            onClick={() => void openDomainManager(item.domain)}
                             className="rounded border border-neutral-300 px-2 py-1 text-xs hover:bg-neutral-100"
                           >
-                            {expanded ? "Ver menos" : "Ver más"}
+                            Gestionar
                           </button>
-                        ) : (
-                          <span className="text-xs text-neutral-400">-</span>
-                        )}
+                        </div>
                       </td>
                     </tr>
                   )})}
@@ -613,6 +757,145 @@ export default function IntranetPage() {
               </div>
             </section>
           )}
+
+          <section className="space-y-3 rounded-lg border border-neutral-200 bg-neutral-50 p-4">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-lg font-semibold text-neutral-900">Gestión dominio (API proveedor)</h2>
+              <div className="flex items-center gap-2">
+                {selectedDomain ? (
+                  <button
+                    onClick={() => void refreshProviderDns()}
+                    disabled={providerLoading}
+                    className="rounded-md border border-neutral-300 px-3 py-1 text-xs hover:bg-neutral-100 disabled:opacity-50"
+                  >
+                    Refrescar DNS
+                  </button>
+                ) : null}
+              </div>
+            </div>
+
+            {!selectedDomain ? (
+              <p className="text-sm text-neutral-600">Pulsa “Gestionar” en cualquier fila para abrir su panel.</p>
+            ) : (
+              <div className="space-y-3">
+                <p className="text-sm text-neutral-700">
+                  Dominio seleccionado: <span className="font-medium">{selectedDomain}</span>
+                </p>
+                {providerError ? (
+                  <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{providerError}</p>
+                ) : null}
+
+                {providerLoading ? <p className="text-sm text-neutral-500">Cargando datos del proveedor...</p> : null}
+
+                {providerData ? (
+                  <>
+                    <div className="rounded-md border border-neutral-200 bg-white p-3">
+                      <h3 className="mb-2 text-sm font-semibold text-neutral-800">Ficha dominio</h3>
+                      <div className="grid gap-2 md:grid-cols-2">
+                        {Object.entries(providerData.info).map(([key, value]) => (
+                          <div key={key} className="rounded border border-neutral-200 px-2 py-1 text-xs">
+                            <p className="font-medium text-neutral-700">{key}</p>
+                            <p className="text-neutral-600">{formatRawValue(value)}</p>
+                          </div>
+                        ))}
+                        {!Object.keys(providerData.info).length ? <p className="text-sm text-neutral-500">Sin datos de ficha.</p> : null}
+                      </div>
+                    </div>
+
+                    <div className="rounded-md border border-neutral-200 bg-white p-3">
+                      <h3 className="mb-2 text-sm font-semibold text-neutral-800">Crear registro DNS</h3>
+                      <div className="grid gap-2 md:grid-cols-5">
+                        <select
+                          value={dnsForm.type}
+                          onChange={(e) => setDnsForm((prev) => ({ ...prev, type: e.target.value }))}
+                          className="rounded border border-neutral-300 px-2 py-1 text-sm"
+                        >
+                          {["A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA"].map((option) => (
+                            <option key={option} value={option}>
+                              {option}
+                            </option>
+                          ))}
+                        </select>
+                        <input
+                          type="text"
+                          value={dnsForm.name}
+                          onChange={(e) => setDnsForm((prev) => ({ ...prev, name: e.target.value }))}
+                          placeholder="Host (@ o www)"
+                          className="rounded border border-neutral-300 px-2 py-1 text-sm"
+                        />
+                        <input
+                          type="text"
+                          value={dnsForm.value}
+                          onChange={(e) => setDnsForm((prev) => ({ ...prev, value: e.target.value }))}
+                          placeholder="Target / Value"
+                          className="rounded border border-neutral-300 px-2 py-1 text-sm md:col-span-2"
+                        />
+                        <input
+                          type="number"
+                          min={60}
+                          value={dnsForm.ttl}
+                          onChange={(e) => setDnsForm((prev) => ({ ...prev, ttl: e.target.value }))}
+                          placeholder="TTL"
+                          className="rounded border border-neutral-300 px-2 py-1 text-sm"
+                        />
+                      </div>
+                      <div className="mt-2">
+                        <button
+                          onClick={() => void createDnsRecord()}
+                          disabled={dnsSaving || providerLoading}
+                          className="rounded-md bg-neutral-900 px-3 py-1 text-xs text-white hover:bg-neutral-800 disabled:opacity-50"
+                        >
+                          {dnsSaving ? "Guardando..." : "Crear registro"}
+                        </button>
+                      </div>
+                    </div>
+
+                    <div className="overflow-x-auto rounded-md border border-neutral-200 bg-white">
+                      <table className="min-w-full text-sm">
+                        <thead className="bg-neutral-50">
+                          <tr>
+                            <th className="px-3 py-2 text-left">ID</th>
+                            <th className="px-3 py-2 text-left">Tipo</th>
+                            <th className="px-3 py-2 text-left">Host</th>
+                            <th className="px-3 py-2 text-left">Valor</th>
+                            <th className="px-3 py-2 text-left">TTL</th>
+                            <th className="px-3 py-2 text-left">Acción</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {providerData.dnsRecords.map((record) => (
+                            <tr key={record.id} className="border-t border-neutral-200">
+                              <td className="px-3 py-2 text-xs text-neutral-700">{record.id}</td>
+                              <td className="px-3 py-2">{record.type}</td>
+                              <td className="px-3 py-2">{record.name}</td>
+                              <td className="max-w-xs truncate px-3 py-2">{record.value}</td>
+                              <td className="px-3 py-2">{record.ttl ?? "-"}</td>
+                              <td className="px-3 py-2">
+                                <button
+                                  onClick={() => void deleteDnsRecord(record.id)}
+                                  disabled={dnsSaving || providerLoading}
+                                  className="rounded border border-red-300 px-2 py-1 text-xs text-red-700 hover:bg-red-50 disabled:opacity-50"
+                                >
+                                  Eliminar
+                                </button>
+                              </td>
+                            </tr>
+                          ))}
+                          {!providerData.dnsRecords.length ? (
+                            <tr>
+                              <td colSpan={6} className="px-3 py-6 text-center text-sm text-neutral-500">
+                                Sin registros DNS.
+                              </td>
+                            </tr>
+                          ) : null}
+                        </tbody>
+                      </table>
+                    </div>
+                  </>
+                ) : null}
+              </div>
+            )}
+          </section>
 
           <div className="flex items-center justify-between">
             <button

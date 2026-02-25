@@ -59,9 +59,17 @@ function getPool(): Pool {
   }
 
   const shouldUseSsl = !connectionString.includes("localhost") && !connectionString.includes("127.0.0.1");
+  let normalizedConnectionString = connectionString;
+  try {
+    const parsed = new URL(connectionString);
+    parsed.searchParams.delete("sslmode");
+    normalizedConnectionString = parsed.toString();
+  } catch {
+    normalizedConnectionString = connectionString;
+  }
 
   pool = new Pool({
-    connectionString,
+    connectionString: normalizedConnectionString,
     ssl: shouldUseSsl ? { rejectUnauthorized: false } : undefined,
     max: 10,
   });

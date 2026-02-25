@@ -9,17 +9,17 @@ function getErrorDetails(error: unknown): string {
 }
 
 export async function GET() {
-  return NextResponse.json(getSoindaSyncStatus());
+  return NextResponse.json(await getSoindaSyncStatus());
 }
 
 export async function POST(req: Request) {
   try {
     const body = (await req.json().catch(() => ({}))) as { force?: boolean; reset?: boolean };
     if (body.reset) {
-      resetSoindaCatalog();
+      await resetSoindaCatalog();
     }
     await syncSoindaDomains(Boolean(body.force), true);
-    return NextResponse.json({ success: true, status: getSoindaSyncStatus() });
+    return NextResponse.json({ success: true, status: await getSoindaSyncStatus() });
   } catch (error: unknown) {
     return NextResponse.json(
       {

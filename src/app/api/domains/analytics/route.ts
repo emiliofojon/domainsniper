@@ -41,7 +41,7 @@ export async function GET(req: Request) {
 
     await ensureSoindaDataLoaded();
 
-    const analytics = querySoindaAnalytics({
+    const analytics = await querySoindaAnalytics({
       q,
       tld,
       available,

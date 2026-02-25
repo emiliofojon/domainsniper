@@ -1,6 +1,4 @@
-import fs from "node:fs";
-import path from "node:path";
-import Database from "better-sqlite3";
+import { Pool } from "pg";
 import type { MarketplaceDomain } from "@/lib/types";
 import { fetchExternalDomainsPage } from "@/lib/server/external-domains";
 
@@ -8,17 +6,6 @@ const TWO_HOURS_MS = 2 * 60 * 60 * 1000;
 const PAGE_SIZE_SYNC = 100;
 const ANALYTICS_CACHE_TTL_MS = 5 * 60 * 1000;
 const SYNC_MAX_PAGES_PER_RUN = 80;
-
-type DbDomainRow = {
-  domain: string;
-  tld: string;
-  available: number | null;
-  price: number | null;
-  currency: string | null;
-  status: string | null;
-  raw_json: string;
-  updated_at: string;
-};
 
 type SyncStatus = {
   isSyncing: boolean;
@@ -47,189 +34,163 @@ export type SoindaAnalytics = {
   heatMax: number;
 };
 
-const dbPath = (() => {
-  const folder = path.resolve(process.cwd(), "data");
-  fs.mkdirSync(folder, { recursive: true });
-  return path.join(folder, "soinda-cache.db");
-})();
+type PgDomainRow = {
+  domain: string;
+  tld: string;
+  available: boolean | null;
+  price: number | null;
+  currency: string | null;
+  status: string | null;
+  raw_json: unknown;
+};
 
-let db: Database.Database | null = null;
+let pool: Pool | null = null;
+let initPromise: Promise<void> | null = null;
+let runningSync: Promise<void> | null = null;
+let analyticsVersion = 0;
+const analyticsCache = new Map<string, { ts: number; version: number; value: SoindaAnalytics }>();
 
-function getDb(): Database.Database {
-  if (db) return db;
+function getPool(): Pool {
+  if (pool) return pool;
 
-  const instance = new Database(dbPath);
-  instance.pragma("busy_timeout = 5000");
-  instance.exec(`
-    CREATE TABLE IF NOT EXISTS soinda_domains (
-      domain TEXT PRIMARY KEY,
-      tld TEXT NOT NULL,
-      available INTEGER NULL,
-      price REAL NULL,
-      currency TEXT NULL,
-      status TEXT NULL,
-      raw_json TEXT NOT NULL,
-      updated_at TEXT NOT NULL
-    );
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error("Falta DATABASE_URL para usar PostgreSQL");
+  }
 
-    CREATE TABLE IF NOT EXISTS soinda_meta (
-      key TEXT PRIMARY KEY,
-      value TEXT
-    );
-  `);
+  const shouldUseSsl = !connectionString.includes("localhost") && !connectionString.includes("127.0.0.1");
 
-  db = instance;
-  return instance;
-}
-
-function upsertMany(items: MarketplaceDomain[], nowIso: string) {
-  const instance = getDb();
-  const upsertStmt = instance.prepare(`
-    INSERT INTO soinda_domains (domain, tld, available, price, currency, status, raw_json, updated_at)
-    VALUES (@domain, @tld, @available, @price, @currency, @status, @raw_json, @updated_at)
-    ON CONFLICT(domain) DO UPDATE SET
-      tld=excluded.tld,
-      available=excluded.available,
-      price=excluded.price,
-      currency=excluded.currency,
-      status=excluded.status,
-      raw_json=excluded.raw_json,
-      updated_at=excluded.updated_at
-  `);
-
-  const tx = instance.transaction((batch: MarketplaceDomain[]) => {
-    for (const item of batch) {
-      upsertStmt.run({
-        domain: item.domain,
-        tld: item.tld,
-        available: item.available === null ? null : item.available ? 1 : 0,
-        price: item.price,
-        currency: item.currency,
-        status: item.status,
-        raw_json: JSON.stringify(item.raw || {}),
-        updated_at: nowIso,
-      });
-    }
+  pool = new Pool({
+    connectionString,
+    ssl: shouldUseSsl ? { rejectUnauthorized: false } : undefined,
+    max: 10,
   });
 
-  tx(items);
+  return pool;
 }
 
-function setMeta(key: string, value: string | null) {
-  getDb()
-    .prepare(`INSERT INTO soinda_meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value`)
-    .run(key, value);
-}
+async function ensureInitialized(): Promise<void> {
+  if (!initPromise) {
+    initPromise = (async () => {
+      const db = getPool();
+      await db.query(`
+        CREATE TABLE IF NOT EXISTS soinda_domains (
+          domain TEXT PRIMARY KEY,
+          tld TEXT NOT NULL,
+          available BOOLEAN NULL,
+          price DOUBLE PRECISION NULL,
+          currency TEXT NULL,
+          status TEXT NULL,
+          raw_json JSONB NOT NULL,
+          updated_at TIMESTAMPTZ NOT NULL
+        );
 
-function getMeta(key: string): string | null {
-  const row = getDb().prepare("SELECT value FROM soinda_meta WHERE key = ?").get(key) as
-    | { value: string | null }
-    | undefined;
-  return row?.value ?? null;
-}
+        CREATE TABLE IF NOT EXISTS soinda_meta (
+          key TEXT PRIMARY KEY,
+          value TEXT NULL
+        );
 
-function parseJsonObject(value: string | null): Record<string, unknown> {
-  if (!value) return {};
-  try {
-    const parsed = JSON.parse(value) as unknown;
-    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return {};
-    return parsed as Record<string, unknown>;
-  } catch {
-    return {};
+        CREATE INDEX IF NOT EXISTS idx_soinda_domains_tld ON soinda_domains (tld);
+        CREATE INDEX IF NOT EXISTS idx_soinda_domains_available ON soinda_domains (available);
+        CREATE INDEX IF NOT EXISTS idx_soinda_domains_updated_at ON soinda_domains (updated_at DESC);
+      `);
+    })();
   }
+
+  await initPromise;
 }
 
-function splitTechstack(value: unknown): string[] {
-  const normalized = (input: string) =>
-    input
-      .split(/[,;|/\n]/g)
-      .map((item) => item.trim())
-      .filter(Boolean);
-
-  if (Array.isArray(value)) {
-    return value.flatMap((item) => splitTechstack(item)).filter((item, index, arr) => arr.indexOf(item) === index);
+function asRawObject(value: unknown): Record<string, unknown> {
+  if (value && typeof value === "object" && !Array.isArray(value)) {
+    return value as Record<string, unknown>;
   }
 
   if (typeof value === "string") {
-    const trimmed = value.trim();
-    if (!trimmed) return [];
-
-    const techMatches = Array.from(trimmed.matchAll(/"technology_name"\s*:\s*"([^"]+)"/g))
-      .map((match) => match[1]?.trim())
-      .filter(Boolean) as string[];
-    if (techMatches.length) return techMatches.filter((item, index, arr) => arr.indexOf(item) === index);
-
     try {
-      const parsed = JSON.parse(trimmed) as unknown;
-      if (Array.isArray(parsed) || typeof parsed === "object") return splitTechstack(parsed);
+      const parsed = JSON.parse(value) as unknown;
+      if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+        return parsed as Record<string, unknown>;
+      }
     } catch {
-      // fall through
+      return {};
     }
-
-    return normalized(trimmed);
   }
 
-  if (value && typeof value === "object") {
-    return Object.values(value as Record<string, unknown>)
-      .flatMap((item) => splitTechstack(item))
-      .filter((item, index, arr) => arr.indexOf(item) === index);
-  }
-
-  return [];
+  return {};
 }
 
-function collectAllFields(): string[] {
-  const rows = getDb().prepare("SELECT raw_json FROM soinda_domains").all() as Array<{ raw_json: string }>;
-  const fields = new Set<string>();
-
-  for (const row of rows) {
-    const raw = parseJsonObject(row.raw_json);
-    for (const key of Object.keys(raw)) fields.add(key);
-  }
-
-  return Array.from(fields).sort((a, b) => a.localeCompare(b));
+async function setMeta(key: string, value: string | null): Promise<void> {
+  await ensureInitialized();
+  await getPool().query(
+    `INSERT INTO soinda_meta (key, value)
+     VALUES ($1, $2)
+     ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value`,
+    [key, value]
+  );
 }
 
-function buildFilterWhere(options: {
-  q?: string;
-  tld?: string;
-  available?: boolean | null;
-  columnFilters?: Record<string, string>;
-}): { where: string; params: Array<string | number> } {
-  const whereParts: string[] = [];
-  const params: Array<string | number> = [];
+async function getMeta(key: string): Promise<string | null> {
+  await ensureInitialized();
+  const { rows } = await getPool().query<{ value: string | null }>("SELECT value FROM soinda_meta WHERE key = $1", [key]);
+  return rows[0]?.value ?? null;
+}
 
-  const q = options.q?.trim().toLowerCase() || "";
-  const tld = options.tld?.trim().toLowerCase() || "";
+async function getTotalDomains(): Promise<number> {
+  await ensureInitialized();
+  const { rows } = await getPool().query<{ count: string }>("SELECT COUNT(*)::text as count FROM soinda_domains");
+  return Number(rows[0]?.count || "0");
+}
 
-  if (q) {
-    whereParts.push("LOWER(domain) LIKE ?");
-    params.push(`%${q}%`);
-  }
+async function upsertMany(items: MarketplaceDomain[], nowIso: string): Promise<void> {
+  if (!items.length) return;
+  await ensureInitialized();
 
-  if (tld) {
-    whereParts.push("LOWER(tld) = ?");
-    params.push(tld);
-  }
+  const client = await getPool().connect();
+  try {
+    await client.query("BEGIN");
 
-  if (options.available === true) whereParts.push("available = 1");
-  if (options.available === false) whereParts.push("available = 0");
-
-  for (const [field, value] of Object.entries(options.columnFilters || {})) {
-    const needle = value.trim().toLowerCase();
-    if (!needle) continue;
-
-    if (field === "domain") {
-      whereParts.push("LOWER(domain) LIKE ?");
-      params.push(`%${needle}%`);
-      continue;
+    for (const item of items) {
+      await client.query(
+        `INSERT INTO soinda_domains (domain, tld, available, price, currency, status, raw_json, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb, $8::timestamptz)
+         ON CONFLICT(domain) DO UPDATE SET
+           tld = EXCLUDED.tld,
+           available = EXCLUDED.available,
+           price = EXCLUDED.price,
+           currency = EXCLUDED.currency,
+           status = EXCLUDED.status,
+           raw_json = EXCLUDED.raw_json,
+           updated_at = EXCLUDED.updated_at`,
+        [
+          item.domain,
+          item.tld,
+          item.available,
+          item.price,
+          item.currency,
+          item.status,
+          JSON.stringify(item.raw || {}),
+          nowIso,
+        ]
+      );
     }
 
-    whereParts.push("LOWER(COALESCE(json_extract(raw_json, ?), '')) LIKE ?");
-    params.push(`$."${field}"`, `%${needle}%`);
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
   }
+}
 
-  return { where: whereParts.length ? `WHERE ${whereParts.join(" AND ")}` : "", params };
+async function collectAllFields(): Promise<string[]> {
+  await ensureInitialized();
+  const { rows } = await getPool().query<{ field: string }>(`
+    SELECT DISTINCT key as field
+    FROM soinda_domains, LATERAL jsonb_object_keys(raw_json) as key
+    ORDER BY key ASC
+  `);
+  return rows.map((row) => row.field);
 }
 
 function getCreatedAtFromDomain(domain: MarketplaceDomain): number | null {
@@ -258,92 +219,177 @@ function getMaxCreatedAtIso(items: MarketplaceDomain[]): string | null {
     const ts = getCreatedAtFromDomain(item);
     if (ts && ts > maxTs) maxTs = ts;
   }
-  if (!maxTs) return null;
-  return new Date(maxTs).toISOString();
+  return maxTs ? new Date(maxTs).toISOString() : null;
 }
 
-function getLocalMaxCreatedAtIso(): string | null {
-  const row = getDb()
-    .prepare(
-      `SELECT MAX(
-        COALESCE(
-          json_extract(raw_json, '$.created_at'),
-          json_extract(raw_json, '$.createdAt'),
-          json_extract(raw_json, '$.first_seen_at'),
-          json_extract(raw_json, '$.firstSeenAt'),
-          json_extract(raw_json, '$.updated_at'),
-          json_extract(raw_json, '$.updatedAt')
-        )
-      ) as max_created_at
-      FROM soinda_domains`
-    )
-    .get() as { max_created_at: string | null };
+async function getLocalMaxCreatedAtIso(): Promise<string | null> {
+  await ensureInitialized();
+  const { rows } = await getPool().query<{ max_created_at: string | null }>(`
+    SELECT MAX(
+      COALESCE(
+        raw_json->>'created_at',
+        raw_json->>'createdAt',
+        raw_json->>'first_seen_at',
+        raw_json->>'firstSeenAt',
+        raw_json->>'updated_at',
+        raw_json->>'updatedAt'
+      )
+    ) as max_created_at
+    FROM soinda_domains
+  `);
 
-  if (!row.max_created_at || typeof row.max_created_at !== "string") return null;
-  const ts = Date.parse(row.max_created_at);
-  if (Number.isNaN(ts)) return null;
-  return new Date(ts).toISOString();
+  const raw = rows[0]?.max_created_at;
+  if (!raw) return null;
+  const ts = Date.parse(raw);
+  return Number.isNaN(ts) ? null : new Date(ts).toISOString();
 }
 
-let runningSync: Promise<void> | null = null;
-let analyticsVersion = 0;
-const analyticsCache = new Map<string, { ts: number; version: number; value: SoindaAnalytics }>();
+function splitTechstack(value: unknown): string[] {
+  const normalized = (input: string) =>
+    input
+      .split(/[,;|/\n]/g)
+      .map((item) => item.trim())
+      .filter(Boolean);
+
+  if (Array.isArray(value)) {
+    return value.flatMap((item) => splitTechstack(item)).filter((item, index, arr) => arr.indexOf(item) === index);
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) return [];
+
+    const techMatches = Array.from(trimmed.matchAll(/"technology_name"\s*:\s*"([^"]+)"/g))
+      .map((match) => match[1]?.trim())
+      .filter(Boolean) as string[];
+    if (techMatches.length) return techMatches.filter((item, index, arr) => arr.indexOf(item) === index);
+
+    try {
+      const parsed = JSON.parse(trimmed) as unknown;
+      if (Array.isArray(parsed) || typeof parsed === "object") return splitTechstack(parsed);
+    } catch {
+      // continue
+    }
+
+    return normalized(trimmed);
+  }
+
+  if (value && typeof value === "object") {
+    return Object.values(value as Record<string, unknown>)
+      .flatMap((item) => splitTechstack(item))
+      .filter((item, index, arr) => arr.indexOf(item) === index);
+  }
+
+  return [];
+}
 
 function isRateLimitError(message: string): boolean {
   const normalized = message.toLowerCase();
   return normalized.includes("429") || normalized.includes("too many attempts") || normalized.includes("throttle");
 }
 
-function getNextSyncNotBeforeTs(): number | null {
-  const raw = getMeta("next_sync_not_before");
+async function getNextSyncNotBeforeTs(): Promise<number | null> {
+  const raw = await getMeta("next_sync_not_before");
   if (!raw) return null;
   const ts = Date.parse(raw);
   return Number.isNaN(ts) ? null : ts;
 }
 
-function canSyncNow(): boolean {
-  const nextTs = getNextSyncNotBeforeTs();
+async function canSyncNow(): Promise<boolean> {
+  const nextTs = await getNextSyncNotBeforeTs();
   if (!nextTs) return true;
   return Date.now() >= nextTs;
 }
 
-function isSyncDue(): boolean {
-  const lastSyncAt = getMeta("last_sync_at");
+async function isSyncDue(): Promise<boolean> {
+  const lastSyncAt = await getMeta("last_sync_at");
   if (!lastSyncAt) return true;
   const last = Date.parse(lastSyncAt);
   if (Number.isNaN(last)) return true;
   return Date.now() - last >= TWO_HOURS_MS;
 }
 
-function getSyncMode(): "full" | "incremental" {
-  const raw = (getMeta("sync_mode") || "").trim().toLowerCase();
-  if (raw === "incremental") return "incremental";
-  return "full";
+async function getSyncMode(): Promise<"full" | "incremental"> {
+  const raw = (await getMeta("sync_mode"))?.trim().toLowerCase() || "";
+  return raw === "incremental" ? "incremental" : "full";
 }
 
-export function getSoindaSyncStatus(): SyncStatus {
-  const totalRow = getDb().prepare("SELECT COUNT(*) as count FROM soinda_domains").get() as { count: number };
-  const cursorPage = Math.max(1, Number(getMeta("sync_cursor_page") || "1"));
-  const totalPagesRaw = Number(getMeta("sync_total_pages") || "0");
+export async function getSoindaSyncStatus(): Promise<SyncStatus> {
+  const totalDomains = await getTotalDomains();
+  const cursorPage = Math.max(1, Number((await getMeta("sync_cursor_page")) || "1"));
+  const totalPagesRaw = Number((await getMeta("sync_total_pages")) || "0");
   const totalPages = Number.isFinite(totalPagesRaw) && totalPagesRaw > 0 ? totalPagesRaw : null;
-  const lastPageRaw = Number(getMeta("sync_last_page") || "0");
+  const lastPageRaw = Number((await getMeta("sync_last_page")) || "0");
   const lastPage = Number.isFinite(lastPageRaw) && lastPageRaw > 0 ? lastPageRaw : null;
 
   return {
     isSyncing: runningSync !== null,
-    lastSyncAt: getMeta("last_sync_at"),
-    lastError: getMeta("last_sync_error"),
-    totalDomains: totalRow.count,
-    nextSyncNotBefore: getMeta("next_sync_not_before"),
+    lastSyncAt: await getMeta("last_sync_at"),
+    lastError: await getMeta("last_sync_error"),
+    totalDomains,
+    nextSyncNotBefore: await getMeta("next_sync_not_before"),
     cursorPage,
     totalPages,
     lastPage,
-    sourceCreatedAtMax: getMeta("source_created_at_max"),
-    syncMode: getSyncMode(),
+    sourceCreatedAtMax: await getMeta("source_created_at_max"),
+    syncMode: await getSyncMode(),
   };
 }
 
-export function querySoindaDomains(options: {
+function buildWhere(options: {
+  q?: string;
+  tld?: string;
+  available?: boolean | null;
+  columnFilters?: Record<string, string>;
+}): { whereSql: string; params: Array<string | number | boolean> } {
+  const parts: string[] = [];
+  const params: Array<string | number | boolean> = [];
+
+  const pushParam = (value: string | number | boolean) => {
+    params.push(value);
+    return `$${params.length}`;
+  };
+
+  const q = options.q?.trim().toLowerCase() || "";
+  const tld = options.tld?.trim().toLowerCase() || "";
+
+  if (q) {
+    const p = pushParam(`%${q}%`);
+    parts.push(`LOWER(domain) LIKE ${p}`);
+  }
+
+  if (tld) {
+    const p = pushParam(tld);
+    parts.push(`LOWER(tld) = ${p}`);
+  }
+
+  if (options.available === true || options.available === false) {
+    const p = pushParam(options.available);
+    parts.push(`available = ${p}`);
+  }
+
+  for (const [field, value] of Object.entries(options.columnFilters || {})) {
+    const needle = value.trim().toLowerCase();
+    if (!needle) continue;
+
+    if (field === "domain") {
+      const p = pushParam(`%${needle}%`);
+      parts.push(`LOWER(domain) LIKE ${p}`);
+      continue;
+    }
+
+    const fieldParam = pushParam(field);
+    const needleParam = pushParam(`%${needle}%`);
+    parts.push(`LOWER(COALESCE(raw_json->>${fieldParam}, '')) LIKE ${needleParam}`);
+  }
+
+  return {
+    whereSql: parts.length ? `WHERE ${parts.join(" AND ")}` : "",
+    params,
+  };
+}
+
+export async function querySoindaDomains(options: {
   page: number;
   perPage: number;
   q?: string;
@@ -352,20 +398,22 @@ export function querySoindaDomains(options: {
   columnFilters?: Record<string, string>;
   sortBy?: string;
   sortDir?: "asc" | "desc";
-}): {
+}): Promise<{
   data: MarketplaceDomain[];
   fields: string[];
   total: number;
   hasMore: boolean;
-} {
-  const { where, params } = buildFilterWhere(options);
+}> {
+  await ensureInitialized();
+
+  const { whereSql, params } = buildWhere(options);
   const offset = (options.page - 1) * options.perPage;
   const direction = options.sortDir === "desc" ? "DESC" : "ASC";
 
   const baseSortable = new Set(["domain", "tld", "available", "price", "currency", "status"]);
   const requestedSort = (options.sortBy || "domain").trim();
 
-  let orderBy = "domain ASC";
+  let orderBy = `domain ${direction}`;
   if (baseSortable.has(requestedSort)) {
     if (requestedSort === "available" || requestedSort === "price") {
       orderBy = `${requestedSort} ${direction}`;
@@ -373,46 +421,49 @@ export function querySoindaDomains(options: {
       orderBy = `LOWER(COALESCE(${requestedSort}, '')) ${direction}`;
     }
   } else if (/^[a-zA-Z0-9_]+$/.test(requestedSort)) {
-    const safeField = requestedSort.replace(/"/g, "");
-    orderBy = `LOWER(COALESCE(json_extract(raw_json, '$."${safeField}"'), '')) ${direction}`;
+    orderBy = `LOWER(COALESCE(raw_json->>'${requestedSort}', '')) ${direction}`;
   }
 
-  const countSql = `SELECT COUNT(*) as count FROM soinda_domains ${where}`;
-  const rowsSql = `
-    SELECT domain, tld, available, price, currency, status, raw_json, updated_at
-    FROM soinda_domains
-    ${where}
-    ORDER BY ${orderBy}
-    LIMIT ? OFFSET ?
-  `;
+  const countRes = await getPool().query<{ count: string }>(`SELECT COUNT(*)::text as count FROM soinda_domains ${whereSql}`, params);
+  const total = Number(countRes.rows[0]?.count || "0");
 
-  const total = (getDb().prepare(countSql).get(...params) as { count: number }).count;
-  const rows = getDb().prepare(rowsSql).all(...params, options.perPage, offset) as DbDomainRow[];
+  const rowsRes = await getPool().query<PgDomainRow>(
+    `SELECT domain, tld, available, price, currency, status, raw_json
+     FROM soinda_domains
+     ${whereSql}
+     ORDER BY ${orderBy}
+     LIMIT $${params.length + 1} OFFSET $${params.length + 2}`,
+    [...params, options.perPage, offset]
+  );
 
-  const data = rows.map((row) => ({
+  const data = rowsRes.rows.map((row) => ({
     domain: row.domain,
     tld: row.tld,
-    available: row.available === null ? null : row.available === 1,
+    available: row.available,
     price: row.price,
     currency: row.currency,
     status: row.status,
-    raw: parseJsonObject(row.raw_json),
+    raw: asRawObject(row.raw_json),
   }));
+
+  const fields = await collectAllFields();
 
   return {
     data,
-    fields: collectAllFields(),
+    fields,
     total,
     hasMore: offset + options.perPage < total,
   };
 }
 
-export function querySoindaAnalytics(options: {
+export async function querySoindaAnalytics(options: {
   q?: string;
   tld?: string;
   available?: boolean | null;
   columnFilters?: Record<string, string>;
-}): SoindaAnalytics {
+}): Promise<SoindaAnalytics> {
+  await ensureInitialized();
+
   const cacheKey = JSON.stringify({
     q: options.q || "",
     tld: options.tld || "",
@@ -430,48 +481,49 @@ export function querySoindaAnalytics(options: {
     return cached.value;
   }
 
-  const { where, params } = buildFilterWhere(options);
-  const instance = getDb();
+  const { whereSql, params } = buildWhere(options);
 
-  const total = (instance.prepare(`SELECT COUNT(*) as count FROM soinda_domains ${where}`).get(...params) as {
-    count: number;
-  }).count;
+  const total = Number((await getPool().query<{ count: string }>(`SELECT COUNT(*)::text as count FROM soinda_domains ${whereSql}`, params)).rows[0]?.count || "0");
 
-  const available = (
-    instance
-      .prepare(`SELECT COUNT(*) as count FROM soinda_domains ${where ? `${where} AND` : "WHERE"} available = 1`)
-      .get(...params) as { count: number }
-  ).count;
-
-  const avgPrice = (
-    instance
-      .prepare(`SELECT AVG(price) as avg_price FROM soinda_domains ${where ? `${where} AND` : "WHERE"} price IS NOT NULL`)
-      .get(...params) as { avg_price: number | null }
-  ).avg_price;
-
-  const uniqueTlds = (
-    instance.prepare(`SELECT COUNT(DISTINCT tld) as count FROM soinda_domains ${where}`).get(...params) as {
-      count: number;
-    }
-  ).count;
-
-  const topTlds = (
-    instance
-      .prepare(
-        `SELECT tld as label, COUNT(*) as value FROM soinda_domains ${where} GROUP BY tld ORDER BY value DESC LIMIT 8`
+  const available = Number(
+    (
+      await getPool().query<{ count: string }>(
+        `SELECT COUNT(*)::text as count FROM soinda_domains ${whereSql ? `${whereSql} AND` : "WHERE"} available = true`,
+        params
       )
-      .all(...params) as Array<{ label: string; value: number }>
+    ).rows[0]?.count || "0"
   );
 
-  const rows = instance
-    .prepare(`SELECT tld, raw_json FROM soinda_domains ${where}`)
-    .all(...params) as Array<{ tld: string; raw_json: string }>;
+  const avgPriceRaw = (
+    await getPool().query<{ avg_price: number | null }>(
+      `SELECT AVG(price) as avg_price FROM soinda_domains ${whereSql ? `${whereSql} AND` : "WHERE"} price IS NOT NULL`,
+      params
+    )
+  ).rows[0]?.avg_price;
+  const avgPrice = typeof avgPriceRaw === "number" ? avgPriceRaw : null;
+
+  const uniqueTlds = Number(
+    (
+      await getPool().query<{ count: string }>(`SELECT COUNT(DISTINCT tld)::text as count FROM soinda_domains ${whereSql}`, params)
+    ).rows[0]?.count || "0"
+  );
+
+  const topTlds = (
+    await getPool().query<{ label: string; value: string }>(
+      `SELECT tld as label, COUNT(*)::text as value FROM soinda_domains ${whereSql} GROUP BY tld ORDER BY COUNT(*) DESC LIMIT 8`,
+      params
+    )
+  ).rows.map((row) => ({ label: row.label, value: Number(row.value) }));
+
+  const rows = (
+    await getPool().query<{ tld: string; raw_json: unknown }>(`SELECT tld, raw_json FROM soinda_domains ${whereSql}`, params)
+  ).rows;
 
   const techMap = new Map<string, number>();
   const levelMap = new Map<string, number>();
 
   for (const row of rows) {
-    const raw = parseJsonObject(row.raw_json);
+    const raw = asRawObject(row.raw_json);
     const levelRaw = raw.tech_level ?? raw.techLevel ?? raw.nivel_tecnico;
     const level = typeof levelRaw === "string" && levelRaw.trim() ? levelRaw.trim().toLowerCase() : "unknown";
     levelMap.set(level, (levelMap.get(level) || 0) + 1);
@@ -497,10 +549,9 @@ export function querySoindaAnalytics(options: {
       let count = 0;
       for (const row of rows) {
         if (row.tld !== rowTld) continue;
-        const raw = parseJsonObject(row.raw_json);
+        const raw = asRawObject(row.raw_json);
         const levelRaw = raw.tech_level ?? raw.techLevel ?? raw.nivel_tecnico;
-        const level =
-          typeof levelRaw === "string" && levelRaw.trim() ? levelRaw.trim().toLowerCase() : "unknown";
+        const level = typeof levelRaw === "string" && levelRaw.trim() ? levelRaw.trim().toLowerCase() : "unknown";
         if (level === colLevel) count += 1;
       }
       return count;
@@ -530,24 +581,24 @@ export function querySoindaAnalytics(options: {
 export async function syncSoindaDomains(force = false, bypassSchedule = false): Promise<void> {
   if (runningSync) return runningSync;
 
-  if (!bypassSchedule && !force && (!isSyncDue() || !canSyncNow())) return;
+  if (!bypassSchedule && !force && (!(await isSyncDue()) || !(await canSyncNow()))) return;
   if (force) {
-    setMeta("next_sync_not_before", null);
-    setMeta("sync_mode", "full");
-    setMeta("sync_cursor_page", "1");
-    setMeta("sync_total_pages", null);
+    await setMeta("next_sync_not_before", null);
+    await setMeta("sync_mode", "full");
+    await setMeta("sync_cursor_page", "1");
+    await setMeta("sync_total_pages", null);
   }
 
   runningSync = (async () => {
-    setMeta("last_sync_error", null);
-    setMeta("sync_started_at", new Date().toISOString());
+    await setMeta("last_sync_error", null);
+    await setMeta("sync_started_at", new Date().toISOString());
 
-    const totalRow = getDb().prepare("SELECT COUNT(*) as count FROM soinda_domains").get() as { count: number };
-    const mode = force ? "full" : totalRow.count === 0 ? "full" : getSyncMode();
-    setMeta("sync_mode", mode);
+    const totalDomains = await getTotalDomains();
+    const mode = force ? "full" : totalDomains === 0 ? "full" : await getSyncMode();
+    await setMeta("sync_mode", mode);
 
-    let page = Math.max(1, Number(getMeta("sync_cursor_page") || "1"));
-    let totalPages = Number(getMeta("sync_total_pages") || "0");
+    let page = Math.max(1, Number((await getMeta("sync_cursor_page")) || "1"));
+    let totalPages = Number((await getMeta("sync_total_pages")) || "0");
     if (!Number.isFinite(totalPages) || totalPages <= 0) totalPages = 0;
     let pagesProcessed = 0;
     let completed = false;
@@ -555,10 +606,10 @@ export async function syncSoindaDomains(force = false, bypassSchedule = false): 
 
     let cursorCreatedAtTs = Number.NaN;
     if (mode === "incremental") {
-      let cursorRaw = getMeta("source_created_at_max");
+      let cursorRaw = await getMeta("source_created_at_max");
       if (!cursorRaw) {
-        cursorRaw = getLocalMaxCreatedAtIso();
-        if (cursorRaw) setMeta("source_created_at_max", cursorRaw);
+        cursorRaw = await getLocalMaxCreatedAtIso();
+        if (cursorRaw) await setMeta("source_created_at_max", cursorRaw);
       }
       cursorCreatedAtTs = cursorRaw ? Date.parse(cursorRaw) : Number.NaN;
     }
@@ -566,17 +617,17 @@ export async function syncSoindaDomains(force = false, bypassSchedule = false): 
     while (true) {
       const current = await fetchExternalDomainsPage(page, PAGE_SIZE_SYNC);
       const nowIso = new Date().toISOString();
-      upsertMany(current.data, nowIso);
+      await upsertMany(current.data, nowIso);
       pagesProcessed += 1;
 
       if (totalPages === 0 && typeof current.total === "number") {
         totalPages = Math.max(1, Math.ceil(current.total / PAGE_SIZE_SYNC));
-        setMeta("sync_total_pages", String(totalPages));
+        await setMeta("sync_total_pages", String(totalPages));
       }
 
-      setMeta("sync_last_page", String(page));
-      setMeta("sync_last_source_count", String(current.sourceCount));
-      setMeta("sync_last_normalized_count", String(current.data.length));
+      await setMeta("sync_last_page", String(page));
+      await setMeta("sync_last_source_count", String(current.sourceCount));
+      await setMeta("sync_last_normalized_count", String(current.data.length));
 
       const pageMaxIso = getMaxCreatedAtIso(current.data);
       const pageMaxTs = pageMaxIso ? Date.parse(pageMaxIso) : Number.NaN;
@@ -598,7 +649,7 @@ export async function syncSoindaDomains(force = false, bypassSchedule = false): 
       }
 
       if (pagesProcessed >= SYNC_MAX_PAGES_PER_RUN) {
-        setMeta("sync_cursor_page", String(page + 1));
+        await setMeta("sync_cursor_page", String(page + 1));
         break;
       }
 
@@ -607,29 +658,29 @@ export async function syncSoindaDomains(force = false, bypassSchedule = false): 
     }
 
     if (maxSeenTs > 0) {
-      setMeta("source_created_at_max", new Date(maxSeenTs).toISOString());
+      await setMeta("source_created_at_max", new Date(maxSeenTs).toISOString());
     }
 
     if (completed) {
-      setMeta("last_sync_at", new Date().toISOString());
-      setMeta("sync_finished_at", new Date().toISOString());
-      setMeta("next_sync_not_before", null);
-      setMeta("sync_cursor_page", "1");
-      setMeta("sync_total_pages", null);
-      if (mode === "full") setMeta("sync_mode", "incremental");
+      await setMeta("last_sync_at", new Date().toISOString());
+      await setMeta("sync_finished_at", new Date().toISOString());
+      await setMeta("next_sync_not_before", null);
+      await setMeta("sync_cursor_page", "1");
+      await setMeta("sync_total_pages", null);
+      if (mode === "full") await setMeta("sync_mode", "incremental");
     }
 
     analyticsVersion += 1;
     analyticsCache.clear();
   })()
-    .catch((error: unknown) => {
+    .catch(async (error: unknown) => {
       const message = error instanceof Error ? error.message : String(error);
       if (isRateLimitError(message)) {
         const blockedUntil = new Date(Date.now() + TWO_HOURS_MS).toISOString();
-        setMeta("next_sync_not_before", blockedUntil);
-        setMeta("last_sync_error", `Rate limited by Soinda (429). Next retry after ${blockedUntil}`);
+        await setMeta("next_sync_not_before", blockedUntil);
+        await setMeta("last_sync_error", `Rate limited by Soinda (429). Next retry after ${blockedUntil}`);
       } else {
-        setMeta("last_sync_error", message);
+        await setMeta("last_sync_error", message);
       }
       throw error;
     })
@@ -641,9 +692,8 @@ export async function syncSoindaDomains(force = false, bypassSchedule = false): 
 }
 
 export async function ensureSoindaDataLoaded(): Promise<void> {
-  const totalRow = getDb().prepare("SELECT COUNT(*) as count FROM soinda_domains").get() as { count: number };
-
-  if (totalRow.count === 0) {
+  const total = await getTotalDomains();
+  if (total === 0) {
     await syncSoindaDomains(true);
     return;
   }
@@ -651,10 +701,9 @@ export async function ensureSoindaDataLoaded(): Promise<void> {
   void syncSoindaDomains(false);
 }
 
-export function resetSoindaCatalog(): void {
-  const instance = getDb();
-  instance.prepare("DELETE FROM soinda_domains").run();
-  instance.prepare("DELETE FROM soinda_meta").run();
+export async function resetSoindaCatalog(): Promise<void> {
+  await ensureInitialized();
+  await getPool().query("TRUNCATE TABLE soinda_domains, soinda_meta");
   analyticsVersion += 1;
   analyticsCache.clear();
 }

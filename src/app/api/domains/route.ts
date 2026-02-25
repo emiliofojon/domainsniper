@@ -52,7 +52,7 @@ export async function GET(req: Request) {
 
     await ensureSoindaDataLoaded();
 
-    const result = querySoindaDomains({
+    const result = await querySoindaDomains({
       page,
       perPage,
       q,

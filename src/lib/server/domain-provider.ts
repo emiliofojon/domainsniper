@@ -92,7 +92,17 @@ async function providerRequest<T = unknown>(options: RequestOptions): Promise<T>
     init.body = JSON.stringify(options.body);
   }
 
-  const response = await fetch(url, init);
+  let response: Response;
+  try {
+    response = await fetch(url, init);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    const cause =
+      error && typeof error === "object" && "cause" in error
+        ? String((error as { cause?: unknown }).cause)
+        : "";
+    throw new Error(`No se pudo conectar con proveedor (${url}): ${message}${cause ? ` | cause: ${cause}` : ""}`);
+  }
   const text = await response.text();
   const payload = text ? tryJson(text) : null;
 

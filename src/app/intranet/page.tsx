@@ -91,24 +91,46 @@ function formatRawValue(value: unknown): string {
   }
 }
 
-function renderRawValue(field: string, value: unknown): React.ReactNode {
+function renderRawValue(field: string, value: unknown, expanded = false): React.ReactNode {
   const compactField = field.toLowerCase().replace(/[_\s-]/g, "");
   if (compactField.includes("techstack")) {
     const items = splitTechstack(value);
     if (!items.length) return "-";
+    const visible = expanded ? items : items.slice(0, 2);
 
     return (
-      <div className="flex max-w-xs flex-wrap gap-1">
-        {items.map((item) => (
+      <div className={`flex max-w-xs gap-1 ${expanded ? "flex-wrap" : "overflow-hidden whitespace-nowrap"}`}>
+        {visible.map((item) => (
           <span key={item} className="rounded bg-neutral-200 px-2 py-0.5 text-xs text-neutral-800">
             {item}
           </span>
         ))}
+        {!expanded && items.length > visible.length ? (
+          <span className="rounded bg-neutral-100 px-2 py-0.5 text-xs text-neutral-600">+{items.length - visible.length}</span>
+        ) : null}
       </div>
     );
   }
 
-  return formatRawValue(value);
+  const text = formatRawValue(value);
+  if (expanded) return text;
+  return <div className="max-w-xs truncate">{text}</div>;
+}
+
+function rowHasExpandableContent(item: MarketplaceDomain, fields: string[]): boolean {
+  for (const field of fields) {
+    const compactField = field.toLowerCase().replace(/[_\s-]/g, "");
+    const value = item.raw?.[field];
+    if (compactField.includes("techstack")) {
+      if (splitTechstack(value).length > 2) return true;
+      continue;
+    }
+
+    const text = formatRawValue(value);
+    if (text.length > 42) return true;
+  }
+
+  return false;
 }
 
 export default function IntranetPage() {
@@ -130,6 +152,7 @@ export default function IntranetPage() {
   const [totalMatches, setTotalMatches] = useState<number | null>(null);
   const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
   const [analytics, setAnalytics] = useState<DashboardAnalytics | null>(null);
+  const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
 
   const tldOptions = useMemo(() => {
     const set = new Set<string>();
@@ -193,6 +216,7 @@ export default function IntranetPage() {
       setDomainFields(payload.fields || []);
       setHasMore(Boolean(payload.pagination?.hasMore));
       setTotalMatches(payload.pagination?.total ?? null);
+      setExpandedRows(new Set());
     } catch (error: unknown) {
       setDomains([]);
       setDomainFields([]);
@@ -424,6 +448,7 @@ export default function IntranetPage() {
                         </div>
                       </th>
                     ))}
+                    <th className="px-3 py-2 font-medium">Detalle</th>
                   </tr>
                   <tr>
                     <th className="px-3 py-2">
@@ -446,23 +471,49 @@ export default function IntranetPage() {
                         />
                       </th>
                     ))}
+                    <th className="px-3 py-2" />
                   </tr>
                 </thead>
                 <tbody>
-                  {domains.map((item) => (
+                  {domains.map((item) => {
+                    const expanded = expandedRows.has(item.domain);
+                    const canExpand = rowHasExpandableContent(item, domainFields);
+                    return (
                     <tr key={item.domain} className="border-t border-neutral-200">
-                      <td className="px-3 py-2 font-medium text-neutral-900">{item.domain}</td>
+                      <td className={`px-3 ${expanded ? "py-3" : "py-2"} font-medium text-neutral-900`}>
+                        <div className={expanded ? "" : "max-w-xs truncate"}>{item.domain}</div>
+                      </td>
                       {domainFields.map((field) => (
-                        <td key={`${item.domain}-${field}`} className="max-w-xs px-3 py-2 text-neutral-700">
-                          {renderRawValue(field, item.raw?.[field])}
+                        <td key={`${item.domain}-${field}`} className={`max-w-xs px-3 ${expanded ? "py-3" : "py-2"} text-neutral-700`}>
+                          {renderRawValue(field, item.raw?.[field], expanded)}
                         </td>
                       ))}
+                      <td className={`px-3 ${expanded ? "py-3" : "py-2"} align-top`}>
+                        {canExpand ? (
+                          <button
+                            type="button"
+                            onClick={() =>
+                              setExpandedRows((prev) => {
+                                const next = new Set(prev);
+                                if (next.has(item.domain)) next.delete(item.domain);
+                                else next.add(item.domain);
+                                return next;
+                              })
+                            }
+                            className="rounded border border-neutral-300 px-2 py-1 text-xs hover:bg-neutral-100"
+                          >
+                            {expanded ? "Ver menos" : "Ver más"}
+                          </button>
+                        ) : (
+                          <span className="text-xs text-neutral-400">-</span>
+                        )}
+                      </td>
                     </tr>
-                  ))}
+                  )})}
 
                   {!domains.length && !loadingDomains ? (
                     <tr>
-                      <td colSpan={1 + domainFields.length} className="px-3 py-8 text-center text-neutral-600">
+                      <td colSpan={2 + domainFields.length} className="px-3 py-8 text-center text-neutral-600">
                         Sin resultados. Ajusta filtros o pulsa Buscar.
                       </td>
                     </tr>

@@ -5,7 +5,7 @@ import Link from "next/link";
 import { RoleGuard } from "@/components/role-guard";
 import type { MarketplaceDomain, MarketplaceDomainResponse } from "@/lib/types";
 
-const PAGE_SIZES = [25, 50, 100];
+const PAGE_SIZES = [25, 50, 100, 250, 500];
 
 type DashboardAnalytics = {
   total: number;
@@ -690,10 +690,10 @@ export default function IntranetPage() {
 
           {viewMode === "table" ? (
             <section className="overflow-x-auto rounded-lg border border-neutral-200">
-              <table className="min-w-full text-sm">
+              <table className="min-w-full text-xs">
                 <thead className="bg-neutral-50 text-left text-neutral-700">
                   <tr>
-                    <th className="px-3 py-2 font-medium">
+                    <th className="px-3 py-1.5 font-medium">
                       <div className="inline-flex items-center gap-2">
                         <span>Dominio</span>
                         <button onClick={() => setSort("domain", "asc")} className={`text-xs ${sortBy === "domain" && sortDir === "asc" ? "font-bold" : "opacity-60"}`}>↑</button>
@@ -701,7 +701,7 @@ export default function IntranetPage() {
                       </div>
                     </th>
                     {domainFields.map((field) => (
-                      <th key={field} className="px-3 py-2 font-medium">
+                      <th key={field} className="px-3 py-1.5 font-medium">
                         <div className="inline-flex items-center gap-2">
                           <span>{formatFieldLabel(field)}</span>
                           <button onClick={() => setSort(field, "asc")} className={`text-xs ${sortBy === field && sortDir === "asc" ? "font-bold" : "opacity-60"}`}>↑</button>
@@ -709,30 +709,30 @@ export default function IntranetPage() {
                         </div>
                       </th>
                     ))}
-                    <th className="px-3 py-2 font-medium">Detalle</th>
+                    <th className="px-3 py-1.5 font-medium">Detalle</th>
                   </tr>
                   <tr>
-                    <th className="px-3 py-2">
+                    <th className="px-3 py-1.5">
                       <input
                         type="text"
                         placeholder="Filtrar dominio"
                         value={columnFilters.domain || ""}
                         onChange={(e) => setColumnFilters((prev) => ({ ...prev, domain: e.target.value }))}
-                        className="w-full rounded border border-neutral-300 px-2 py-1 text-xs"
+                        className="w-full rounded border border-neutral-300 px-2 py-0.5 text-xs"
                       />
                     </th>
                     {domainFields.map((field) => (
-                      <th key={`${field}-filter`} className="px-3 py-2">
+                      <th key={`${field}-filter`} className="px-3 py-1.5">
                         <input
                           type="text"
                           placeholder={`Filtrar ${formatFieldLabel(field)}`}
                           value={columnFilters[field] || ""}
                           onChange={(e) => setColumnFilters((prev) => ({ ...prev, [field]: e.target.value }))}
-                          className="w-full rounded border border-neutral-300 px-2 py-1 text-xs"
+                          className="w-full rounded border border-neutral-300 px-2 py-0.5 text-xs"
                         />
                       </th>
                     ))}
-                    <th className="px-3 py-2" />
+                    <th className="px-3 py-1.5" />
                   </tr>
                 </thead>
                 <tbody>
@@ -741,15 +741,15 @@ export default function IntranetPage() {
                     const canExpand = rowHasExpandableContent(item, domainFields);
                     return (
                     <tr key={item.domain} className="border-t border-neutral-200">
-                      <td className={`px-3 ${expanded ? "py-3" : "py-2"} font-medium text-neutral-900`}>
+                      <td className={`px-3 ${expanded ? "py-2" : "py-1"} font-medium text-neutral-900`}>
                         <div className={expanded ? "" : "max-w-xs truncate"}>{item.domain}</div>
                       </td>
                       {domainFields.map((field) => (
-                        <td key={`${item.domain}-${field}`} className={`max-w-xs px-3 ${expanded ? "py-3" : "py-2"} text-neutral-700`}>
+                        <td key={`${item.domain}-${field}`} className={`max-w-xs px-3 ${expanded ? "py-2" : "py-1"} text-neutral-700`}>
                           {renderRawValue(field, item.raw?.[field], expanded)}
                         </td>
                       ))}
-                      <td className={`px-3 ${expanded ? "py-3" : "py-2"} align-top`}>
+                      <td className={`px-3 ${expanded ? "py-2" : "py-1"} align-top`}>
                         <div className="flex flex-wrap gap-2">
                           {canExpand ? (
                             <button

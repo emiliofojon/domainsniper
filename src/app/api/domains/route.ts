@@ -27,7 +27,7 @@ export async function GET(req: Request) {
     const { searchParams } = new URL(req.url);
 
     const page = Math.max(1, Number(searchParams.get("page") || "1"));
-    const perPage = Math.min(100, Math.max(1, Number(searchParams.get("per_page") || "25")));
+    const perPage = Math.min(500, Math.max(1, Number(searchParams.get("per_page") || "25")));
 
     const q = (searchParams.get("q") || "").trim().toLowerCase();
     const tld = (searchParams.get("tld") || "").trim().toLowerCase();

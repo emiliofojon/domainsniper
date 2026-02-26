@@ -48,6 +48,19 @@ type ProviderDomainSnapshot = {
   dnsRecords: ProviderDnsRecord[];
 };
 
+type PublicDnsSnapshot = {
+  domain: string;
+  hasDns: boolean;
+  records: {
+    A: string[];
+    AAAA: string[];
+    CNAME: string[];
+    MX: string[];
+    NS: string[];
+    TXT: string[];
+  };
+};
+
 function getErrorDetails(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -173,6 +186,9 @@ export default function IntranetPage() {
   const [providerData, setProviderData] = useState<ProviderDomainSnapshot | null>(null);
   const [dnsForm, setDnsForm] = useState({ type: "A", name: "@", value: "", ttl: "3600" });
   const [dnsSaving, setDnsSaving] = useState(false);
+  const [publicDnsLoading, setPublicDnsLoading] = useState(false);
+  const [publicDnsError, setPublicDnsError] = useState<string | null>(null);
+  const [publicDns, setPublicDns] = useState<PublicDnsSnapshot | null>(null);
 
   const tldOptions = useMemo(() => {
     const set = new Set<string>();
@@ -301,6 +317,8 @@ export default function IntranetPage() {
     setSelectedDomain(domain);
     setProviderLoading(true);
     setProviderError(null);
+    setPublicDnsError(null);
+    setPublicDns(null);
     try {
       const response = await fetch(`/api/provider/domain?domain=${encodeURIComponent(domain)}`);
       const payload = (await response.json()) as ProviderDomainSnapshot & { error?: string; details?: string };
@@ -411,6 +429,23 @@ export default function IntranetPage() {
     },
     [selectedDomain]
   );
+
+  const checkPublicDns = useCallback(async () => {
+    if (!selectedDomain) return;
+    setPublicDnsLoading(true);
+    setPublicDnsError(null);
+    try {
+      const response = await fetch(`/api/provider/public-dns?domain=${encodeURIComponent(selectedDomain)}`);
+      const payload = (await response.json()) as PublicDnsSnapshot & { error?: string; details?: string };
+      if (!response.ok) throw new Error(payload.details || payload.error || "No se pudo comprobar DNS pública");
+      setPublicDns(payload);
+    } catch (error: unknown) {
+      setPublicDns(null);
+      setPublicDnsError(getErrorDetails(error));
+    } finally {
+      setPublicDnsLoading(false);
+    }
+  }, [selectedDomain]);
 
   const setSort = useCallback((field: string, dir: "asc" | "desc") => {
     setPage(1);
@@ -764,6 +799,15 @@ export default function IntranetPage() {
               <div className="flex items-center gap-2">
                 {selectedDomain ? (
                   <button
+                    onClick={() => void checkPublicDns()}
+                    disabled={publicDnsLoading}
+                    className="rounded-md border border-neutral-300 px-3 py-1 text-xs hover:bg-neutral-100 disabled:opacity-50"
+                  >
+                    {publicDnsLoading ? "Comprobando DNS..." : "Comprobar DNS pública"}
+                  </button>
+                ) : null}
+                {selectedDomain ? (
+                  <button
                     onClick={() => void refreshProviderDns()}
                     disabled={providerLoading}
                     className="rounded-md border border-neutral-300 px-3 py-1 text-xs hover:bg-neutral-100 disabled:opacity-50"
@@ -783,6 +827,28 @@ export default function IntranetPage() {
                 </p>
                 {providerError ? (
                   <p className="rounded-md border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">{providerError}</p>
+                ) : null}
+                {publicDnsError ? (
+                  <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">{publicDnsError}</p>
+                ) : null}
+                {publicDns ? (
+                  <div className="rounded-md border border-neutral-200 bg-white p-3">
+                    <h3 className="mb-2 text-sm font-semibold text-neutral-800">DNS pública</h3>
+                    <p className="mb-2 text-sm text-neutral-700">
+                      Estado:{" "}
+                      <span className={publicDns.hasDns ? "font-semibold text-green-700" : "font-semibold text-red-700"}>
+                        {publicDns.hasDns ? "Tiene registros DNS" : "Sin registros detectados"}
+                      </span>
+                    </p>
+                    <div className="grid gap-2 md:grid-cols-3">
+                      {Object.entries(publicDns.records).map(([type, values]) => (
+                        <div key={type} className="rounded border border-neutral-200 px-2 py-1 text-xs">
+                          <p className="font-medium text-neutral-700">{type}</p>
+                          <p className="text-neutral-600">{values.length ? values.slice(0, 3).join(" | ") : "-"}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
                 ) : null}
 
                 {providerLoading ? <p className="text-sm text-neutral-500">Cargando datos del proveedor...</p> : null}

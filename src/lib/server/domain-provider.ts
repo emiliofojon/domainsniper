@@ -79,6 +79,9 @@ async function providerRequest<T = unknown>(options: RequestOptions): Promise<T>
   const headers: HeadersInit = {
     Accept: "application/json",
     [config.headerName]: config.headerValue,
+    "X-API-Key": config.headerValue,
+    "API-Key": config.headerValue,
+    apikey: config.headerValue,
   };
 
   const init: RequestInit = {

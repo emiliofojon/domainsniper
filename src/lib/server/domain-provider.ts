@@ -38,18 +38,18 @@ function getConfig() {
     throw new Error("Falta DOMAIN_PROVIDER_BASE_URL en el servidor.");
   }
 
-  const headerName = getEnv("DOMAIN_PROVIDER_API_KEY_HEADER", "Authorization");
-  const headerValue = getEnv("DOMAIN_PROVIDER_API_KEY_VALUE", `Bearer ${apiKey}`);
+  const headerName = getEnv("DOMAIN_PROVIDER_API_KEY_HEADER", "X-API-Key");
+  const headerValue = getEnv("DOMAIN_PROVIDER_API_KEY_VALUE", apiKey);
 
   return {
     baseUrl,
     headerName,
     headerValue,
-    domainInfoPath: getEnv("DOMAIN_PROVIDER_DOMAIN_INFO_PATH", "/domains/{domain}"),
-    dnsListPath: getEnv("DOMAIN_PROVIDER_DNS_LIST_PATH", "/domains/{domain}/dns"),
-    dnsCreatePath: getEnv("DOMAIN_PROVIDER_DNS_CREATE_PATH", "/domains/{domain}/dns"),
-    dnsUpdatePath: getEnv("DOMAIN_PROVIDER_DNS_UPDATE_PATH", "/domains/{domain}/dns/{recordId}"),
-    dnsDeletePath: getEnv("DOMAIN_PROVIDER_DNS_DELETE_PATH", "/domains/{domain}/dns/{recordId}"),
+    domainInfoPath: getEnv("DOMAIN_PROVIDER_DOMAIN_INFO_PATH", "/check"),
+    dnsListPath: getEnv("DOMAIN_PROVIDER_DNS_LIST_PATH", "/getDnsRecords"),
+    dnsCreatePath: getEnv("DOMAIN_PROVIDER_DNS_CREATE_PATH", "/dnsrecords/create"),
+    dnsUpdatePath: getEnv("DOMAIN_PROVIDER_DNS_UPDATE_PATH", "/dnsrecords/edit"),
+    dnsDeletePath: getEnv("DOMAIN_PROVIDER_DNS_DELETE_PATH", "/dnsrecords/delete"),
   };
 }
 
@@ -174,14 +174,14 @@ export async function fetchProviderDomain(domain: string): Promise<ProviderDomai
 
   const [infoPayload, dnsPayload] = await Promise.all([
     providerRequest({
-      method: "GET",
+      method: "POST",
       pathTemplate: config.domainInfoPath,
-      params: { domain: safeDomain },
+      body: { domain: safeDomain },
     }),
     providerRequest({
-      method: "GET",
+      method: "POST",
       pathTemplate: config.dnsListPath,
-      params: { domain: safeDomain },
+      body: { domain: safeDomain },
     }),
   ]);
 
@@ -200,8 +200,8 @@ export async function createProviderDnsRecord(
   return providerRequest({
     method: "POST",
     pathTemplate: config.dnsCreatePath,
-    params: { domain: domain.trim().toLowerCase() },
     body: {
+      domain: domain.trim().toLowerCase(),
       type: input.type.trim().toUpperCase(),
       name: input.name.trim(),
       value: input.value.trim(),
@@ -217,13 +217,11 @@ export async function updateProviderDnsRecord(
 ) {
   const config = getConfig();
   return providerRequest({
-    method: "PUT",
+    method: "POST",
     pathTemplate: config.dnsUpdatePath,
-    params: {
-      domain: domain.trim().toLowerCase(),
-      recordId: recordId.trim(),
-    },
     body: {
+      domain: domain.trim().toLowerCase(),
+      id: recordId.trim(),
       ...(input.type ? { type: input.type.trim().toUpperCase() } : {}),
       ...(input.name ? { name: input.name.trim() } : {}),
       ...(input.value ? { value: input.value.trim() } : {}),
@@ -235,11 +233,8 @@ export async function updateProviderDnsRecord(
 export async function deleteProviderDnsRecord(domain: string, recordId: string) {
   const config = getConfig();
   return providerRequest({
-    method: "DELETE",
+    method: "POST",
     pathTemplate: config.dnsDeletePath,
-    params: {
-      domain: domain.trim().toLowerCase(),
-      recordId: recordId.trim(),
-    },
+    body: { domain: domain.trim().toLowerCase(), id: recordId.trim() },
   });
 }

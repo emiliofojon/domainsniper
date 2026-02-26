@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import Link from "next/link";
 import { RoleGuard } from "@/components/role-guard";
 import type { MarketplaceDomain, MarketplaceDomainResponse } from "@/lib/types";
@@ -189,6 +189,7 @@ export default function IntranetPage() {
   const [publicDnsLoading, setPublicDnsLoading] = useState(false);
   const [publicDnsError, setPublicDnsError] = useState<string | null>(null);
   const [publicDns, setPublicDns] = useState<PublicDnsSnapshot | null>(null);
+  const managerSectionRef = useRef<HTMLElement | null>(null);
 
   const tldOptions = useMemo(() => {
     const set = new Set<string>();
@@ -319,6 +320,9 @@ export default function IntranetPage() {
     setProviderError(null);
     setPublicDnsError(null);
     setPublicDns(null);
+    setTimeout(() => {
+      managerSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
+    }, 0);
     try {
       const response = await fetch(`/api/provider/domain?domain=${encodeURIComponent(domain)}`);
       const payload = (await response.json()) as ProviderDomainSnapshot & { error?: string; details?: string };
@@ -597,6 +601,12 @@ export default function IntranetPage() {
             </button>
           </div>
 
+          {selectedDomain ? (
+            <p className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">
+              Dominio seleccionado: <span className="font-semibold">{selectedDomain}</span>. Se abrió la sección “Gestión dominio” más abajo.
+            </p>
+          ) : null}
+
           {viewMode === "table" ? (
             <section className="overflow-x-auto rounded-lg border border-neutral-200">
               <table className="min-w-full text-sm">
@@ -793,7 +803,7 @@ export default function IntranetPage() {
             </section>
           )}
 
-          <section className="space-y-3 rounded-lg border border-neutral-200 bg-neutral-50 p-4">
+          <section ref={managerSectionRef} className="space-y-3 rounded-lg border border-neutral-200 bg-neutral-50 p-4">
             <div className="flex flex-wrap items-center justify-between gap-2">
               <h2 className="text-lg font-semibold text-neutral-900">Gestión dominio (API proveedor)</h2>
               <div className="flex items-center gap-2">

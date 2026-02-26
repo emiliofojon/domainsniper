@@ -1,4 +1,5 @@
 import { Pool } from "pg";
+import { resolve4, resolve6, resolveCname, resolveMx, resolveNs, resolveTxt } from "node:dns/promises";
 import type { MarketplaceDomain } from "@/lib/types";
 import { fetchExternalDomainsPage } from "@/lib/server/external-domains";
 
@@ -18,6 +19,17 @@ type SyncStatus = {
   lastPage: number | null;
   sourceCreatedAtMax: string | null;
   syncMode: "full" | "incremental";
+};
+
+export type ComCheckStatus = {
+  isChecking: boolean;
+  lastRunAt: string | null;
+  lastError: string | null;
+  totalEsDomains: number;
+  checkedEsDomains: number;
+  pendingEsDomains: number;
+  lastProcessed: number;
+  lastMarkedFree: number;
 };
 
 export type SoindaAnalytics = {
@@ -47,6 +59,7 @@ type PgDomainRow = {
 let pool: Pool | null = null;
 let initPromise: Promise<void> | null = null;
 let runningSync: Promise<void> | null = null;
+let runningComCheck: Promise<void> | null = null;
 let analyticsVersion = 0;
 const analyticsCache = new Map<string, { ts: number; version: number; value: SoindaAnalytics }>();
 
@@ -147,6 +160,21 @@ async function getTotalDomains(): Promise<number> {
   await ensureInitialized();
   const { rows } = await getPool().query<{ count: string }>("SELECT COUNT(*)::text as count FROM soinda_domains");
   return Number(rows[0]?.count || "0");
+}
+
+async function getEsStats(): Promise<{ total: number; checked: number; pending: number }> {
+  await ensureInitialized();
+  const totalRes = await getPool().query<{ count: string }>("SELECT COUNT(*)::text as count FROM soinda_domains WHERE tld = 'es'");
+  const checkedRes = await getPool().query<{ count: string }>(
+    "SELECT COUNT(*)::text as count FROM soinda_domains WHERE tld = 'es' AND raw_json ? 'com_libre'"
+  );
+  const total = Number(totalRes.rows[0]?.count || "0");
+  const checked = Number(checkedRes.rows[0]?.count || "0");
+  return {
+    total,
+    checked,
+    pending: Math.max(0, total - checked),
+  };
 }
 
 async function upsertMany(items: MarketplaceDomain[], nowIso: string): Promise<void> {
@@ -586,6 +614,138 @@ export async function querySoindaAnalytics(options: {
   return value;
 }
 
+async function hasAnyPublicDns(domain: string): Promise<boolean> {
+  const safe = domain.trim().toLowerCase();
+  if (!safe) return false;
+
+  const safeResolve = async <T>(fn: () => Promise<T[]>): Promise<number> => {
+    try {
+      const records = await fn();
+      return records.length;
+    } catch {
+      return 0;
+    }
+  };
+
+  const counts = await Promise.all([
+    safeResolve(() => resolve4(safe)),
+    safeResolve(() => resolve6(safe)),
+    safeResolve(() => resolveCname(safe)),
+    safeResolve(() => resolveMx(safe)),
+    safeResolve(() => resolveNs(safe)),
+    safeResolve(() => resolveTxt(safe)),
+  ]);
+
+  return counts.some((count) => count > 0);
+}
+
+async function getEsCandidates(limit: number, force: boolean, offset = 0): Promise<Array<{ domain: string }>> {
+  await ensureInitialized();
+  if (force) {
+    const { rows } = await getPool().query<{ domain: string }>(
+      "SELECT domain FROM soinda_domains WHERE tld = 'es' ORDER BY domain ASC LIMIT $1 OFFSET $2",
+      [limit, Math.max(0, offset)]
+    );
+    return rows;
+  }
+
+  const { rows } = await getPool().query<{ domain: string }>(
+    "SELECT domain FROM soinda_domains WHERE tld = 'es' AND NOT (raw_json ? 'com_libre') ORDER BY domain ASC LIMIT $1",
+    [limit]
+  );
+  return rows;
+}
+
+async function setComResult(esDomain: string, comDomain: string, comLibre: boolean): Promise<void> {
+  await ensureInitialized();
+  await getPool().query(
+    `UPDATE soinda_domains
+     SET raw_json = raw_json || $2::jsonb,
+         updated_at = NOW()
+     WHERE domain = $1`,
+    [
+      esDomain,
+      JSON.stringify({
+        com_domain: comDomain,
+        com_libre: comLibre,
+        com_checked_at: new Date().toISOString(),
+      }),
+    ]
+  );
+}
+
+function buildComFromEs(esDomain: string): string | null {
+  const lower = esDomain.trim().toLowerCase();
+  if (!lower.endsWith(".es")) return null;
+  const base = lower.slice(0, -3);
+  if (!base || base.includes(".")) return null;
+  return `${base}.com`;
+}
+
+export async function getComCheckStatus(): Promise<ComCheckStatus> {
+  const stats = await getEsStats();
+  return {
+    isChecking: runningComCheck !== null,
+    lastRunAt: await getMeta("com_check_last_run_at"),
+    lastError: await getMeta("com_check_last_error"),
+    totalEsDomains: stats.total,
+    checkedEsDomains: stats.checked,
+    pendingEsDomains: stats.pending,
+    lastProcessed: Number((await getMeta("com_check_last_processed")) || "0"),
+    lastMarkedFree: Number((await getMeta("com_check_last_marked_free")) || "0"),
+  };
+}
+
+export async function checkComAvailability(force = false): Promise<void> {
+  if (runningComCheck) return runningComCheck;
+
+  runningComCheck = (async () => {
+    await setMeta("com_check_last_error", null);
+
+    const BATCH = 250;
+    let processed = 0;
+    let markedFree = 0;
+    let offset = 0;
+
+    while (true) {
+      const candidates = await getEsCandidates(BATCH, force, offset);
+      if (!candidates.length) break;
+
+      for (const item of candidates) {
+        const comDomain = buildComFromEs(item.domain);
+        if (!comDomain) continue;
+        const hasDns = await hasAnyPublicDns(comDomain);
+        const comLibre = !hasDns;
+        await setComResult(item.domain, comDomain, comLibre);
+        processed += 1;
+        if (comLibre) markedFree += 1;
+      }
+
+      if (force) {
+        offset += candidates.length;
+      }
+      if (candidates.length < BATCH) break;
+      await new Promise((resolve) => setTimeout(resolve, 150));
+    }
+
+    await setMeta("com_check_last_processed", String(processed));
+    await setMeta("com_check_last_marked_free", String(markedFree));
+    await setMeta("com_check_last_run_at", new Date().toISOString());
+  })()
+    .catch(async (error: unknown) => {
+      const message = error instanceof Error ? error.message : String(error);
+      await setMeta("com_check_last_error", message);
+      throw error;
+    })
+    .finally(() => {
+      analyticsVersion += 1;
+      analyticsCache.clear();
+      runningComCheck = null;
+    });
+
+  return runningComCheck;
+}
+
 export async function syncSoindaDomains(force = false, bypassSchedule = false): Promise<void> {
   if (runningSync) return runningSync;
 
@@ -703,10 +863,12 @@ export async function ensureSoindaDataLoaded(): Promise<void> {
   const total = await getTotalDomains();
   if (total === 0) {
     await syncSoindaDomains(true);
+    void checkComAvailability(false);
     return;
   }
 
   void syncSoindaDomains(false);
+  void checkComAvailability(false);
 }
 
 export async function resetSoindaCatalog(): Promise<void> {

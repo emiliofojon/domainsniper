@@ -34,6 +34,17 @@ type SyncInfo = {
   syncMode: "full" | "incremental";
 };
 
+type ComCheckInfo = {
+  isChecking: boolean;
+  lastRunAt: string | null;
+  lastError: string | null;
+  totalEsDomains: number;
+  checkedEsDomains: number;
+  pendingEsDomains: number;
+  lastProcessed: number;
+  lastMarkedFree: number;
+};
+
 type ProviderDnsRecord = {
   id: string;
   type: string;
@@ -120,6 +131,10 @@ function formatRawValue(value: unknown): string {
 
 function renderRawValue(field: string, value: unknown, expanded = false): React.ReactNode {
   const compactField = field.toLowerCase().replace(/[_\s-]/g, "");
+  if (field === "com_libre" && typeof value === "boolean") {
+    return value ? "Sí" : "No";
+  }
+
   if (compactField.includes("techstack")) {
     const items = splitTechstack(value);
     if (!items.length) return "-";
@@ -142,6 +157,13 @@ function renderRawValue(field: string, value: unknown, expanded = false): React.
   const text = formatRawValue(value);
   if (expanded) return text;
   return <div className="max-w-xs truncate">{text}</div>;
+}
+
+function formatFieldLabel(field: string): string {
+  if (field === "com_libre") return ".com libre";
+  if (field === "com_domain") return ".com";
+  if (field === "com_checked_at") return "com checked at";
+  return field;
 }
 
 function rowHasExpandableContent(item: MarketplaceDomain, fields: string[]): boolean {
@@ -178,6 +200,7 @@ export default function IntranetPage() {
   const [sortDir, setSortDir] = useState<"asc" | "desc">("asc");
   const [totalMatches, setTotalMatches] = useState<number | null>(null);
   const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
+  const [comCheckInfo, setComCheckInfo] = useState<ComCheckInfo | null>(null);
   const [analytics, setAnalytics] = useState<DashboardAnalytics | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
@@ -277,6 +300,17 @@ export default function IntranetPage() {
     }
   }, []);
 
+  const loadComCheckInfo = useCallback(async () => {
+    try {
+      const response = await fetch("/api/domains/com-check");
+      if (!response.ok) return;
+      const payload = (await response.json()) as ComCheckInfo;
+      setComCheckInfo(payload);
+    } catch {
+      // ignore
+    }
+  }, []);
+
   const syncNow = useCallback(async () => {
     setDomainsError(null);
     try {
@@ -288,11 +322,12 @@ export default function IntranetPage() {
       const payload = (await response.json()) as { error?: string; details?: string };
       if (!response.ok) throw new Error(payload.details || payload.error || "No se pudo sincronizar");
       await loadSyncInfo();
+      await loadComCheckInfo();
       await loadDomains();
     } catch (error: unknown) {
       setDomainsError(getErrorDetails(error));
     }
-  }, [loadDomains, loadSyncInfo]);
+  }, [loadComCheckInfo, loadDomains, loadSyncInfo]);
 
   const resetAndSync = useCallback(async () => {
     setDomainsError(null);
@@ -308,11 +343,29 @@ export default function IntranetPage() {
       setPage(1);
       setColumnFilters({});
       await loadSyncInfo();
+      await loadComCheckInfo();
       await loadDomains();
     } catch (error: unknown) {
       setDomainsError(getErrorDetails(error));
     }
-  }, [loadDomains, loadSyncInfo]);
+  }, [loadComCheckInfo, loadDomains, loadSyncInfo]);
+
+  const refreshComLibre = useCallback(async () => {
+    setDomainsError(null);
+    try {
+      const response = await fetch("/api/domains/com-check", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ force: true }),
+      });
+      const payload = (await response.json()) as { error?: string; details?: string };
+      if (!response.ok) throw new Error(payload.details || payload.error || "No se pudo lanzar refresco .com");
+      await loadComCheckInfo();
+      await loadDomains();
+    } catch (error: unknown) {
+      setDomainsError(getErrorDetails(error));
+    }
+  }, [loadComCheckInfo, loadDomains]);
 
   const openDomainManager = useCallback(async (domain: string) => {
     setSelectedDomain(domain);
@@ -462,8 +515,20 @@ export default function IntranetPage() {
   }, [loadSyncInfo]);
 
   useEffect(() => {
+    void loadComCheckInfo();
+  }, [loadComCheckInfo]);
+
+  useEffect(() => {
     void loadDomains();
   }, [loadDomains]);
+
+  useEffect(() => {
+    if (!comCheckInfo?.isChecking) return;
+    const timer = setInterval(() => {
+      void loadComCheckInfo();
+    }, 4000);
+    return () => clearInterval(timer);
+  }, [comCheckInfo?.isChecking, loadComCheckInfo]);
 
   useEffect(() => {
     if (viewMode !== "tableau") return;
@@ -573,6 +638,13 @@ export default function IntranetPage() {
                 Sincronizar ahora
               </button>
               <button
+                onClick={() => void refreshComLibre()}
+                disabled={Boolean(comCheckInfo?.isChecking)}
+                className="rounded-md border border-blue-300 px-3 py-1 text-xs text-blue-700 hover:bg-blue-50 disabled:opacity-50"
+              >
+                Refrescar .com libre (manual)
+              </button>
+              <button
                 onClick={() => void resetAndSync()}
                 disabled={Boolean(syncInfo?.isSyncing)}
                 className="rounded-md border border-red-300 px-3 py-1 text-xs text-red-700 hover:bg-red-50 disabled:opacity-50"
@@ -584,6 +656,15 @@ export default function IntranetPage() {
 
           {syncInfo?.lastError ? (
             <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">Último error de sync: {syncInfo.lastError}</p>
+          ) : null}
+          {comCheckInfo ? (
+            <p className="rounded-md border border-blue-200 bg-blue-50 px-3 py-2 text-sm text-blue-800">
+              .es revisados para .com libre: {comCheckInfo.checkedEsDomains}/{comCheckInfo.totalEsDomains}
+              {comCheckInfo.pendingEsDomains > 0 ? ` (pendientes: ${comCheckInfo.pendingEsDomains})` : ""}.
+              {comCheckInfo.lastRunAt ? ` Última comprobación: ${new Date(comCheckInfo.lastRunAt).toLocaleString()}.` : ""}
+              {comCheckInfo.isChecking ? " Comprobando..." : ""}
+              {comCheckInfo.lastError ? ` Error: ${comCheckInfo.lastError}` : ""}
+            </p>
           ) : null}
 
           <div className="flex items-center gap-2">
@@ -622,7 +703,7 @@ export default function IntranetPage() {
                     {domainFields.map((field) => (
                       <th key={field} className="px-3 py-2 font-medium">
                         <div className="inline-flex items-center gap-2">
-                          <span>{field}</span>
+                          <span>{formatFieldLabel(field)}</span>
                           <button onClick={() => setSort(field, "asc")} className={`text-xs ${sortBy === field && sortDir === "asc" ? "font-bold" : "opacity-60"}`}>↑</button>
                           <button onClick={() => setSort(field, "desc")} className={`text-xs ${sortBy === field && sortDir === "desc" ? "font-bold" : "opacity-60"}`}>↓</button>
                         </div>
@@ -644,7 +725,7 @@ export default function IntranetPage() {
                       <th key={`${field}-filter`} className="px-3 py-2">
                         <input
                           type="text"
-                          placeholder={`Filtrar ${field}`}
+                          placeholder={`Filtrar ${formatFieldLabel(field)}`}
                           value={columnFilters[field] || ""}
                           onChange={(e) => setColumnFilters((prev) => ({ ...prev, [field]: e.target.value }))}
                           className="w-full rounded border border-neutral-300 px-2 py-1 text-xs"

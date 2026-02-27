@@ -72,6 +72,31 @@ type PublicDnsSnapshot = {
   };
 };
 
+type ComStatusSnapshot = {
+  sourceDomain: string;
+  comDomain: string;
+  availability: {
+    available: boolean;
+    confidence: string;
+    reason: string;
+  };
+  whois: {
+    found: boolean;
+    domain: string;
+    registrar: string | null;
+    createdAt: string | null;
+    expiresAt: string | null;
+    statuses: string[];
+  };
+  dns: {
+    hasAnyRecord: boolean;
+  };
+  cdmon: {
+    ok: boolean;
+    raw: unknown;
+  };
+};
+
 function getErrorDetails(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
@@ -212,6 +237,9 @@ export default function IntranetPage() {
   const [publicDnsLoading, setPublicDnsLoading] = useState(false);
   const [publicDnsError, setPublicDnsError] = useState<string | null>(null);
   const [publicDns, setPublicDns] = useState<PublicDnsSnapshot | null>(null);
+  const [comStatusLoading, setComStatusLoading] = useState(false);
+  const [comStatusError, setComStatusError] = useState<string | null>(null);
+  const [comStatus, setComStatus] = useState<ComStatusSnapshot | null>(null);
   const managerSectionRef = useRef<HTMLElement | null>(null);
 
   const tldOptions = useMemo(() => {
@@ -373,6 +401,8 @@ export default function IntranetPage() {
     setProviderError(null);
     setPublicDnsError(null);
     setPublicDns(null);
+    setComStatusError(null);
+    setComStatus(null);
     setTimeout(() => {
       managerSectionRef.current?.scrollIntoView({ behavior: "smooth", block: "start" });
     }, 0);
@@ -501,6 +531,23 @@ export default function IntranetPage() {
       setPublicDnsError(getErrorDetails(error));
     } finally {
       setPublicDnsLoading(false);
+    }
+  }, [selectedDomain]);
+
+  const checkComStatus = useCallback(async () => {
+    if (!selectedDomain) return;
+    setComStatusLoading(true);
+    setComStatusError(null);
+    try {
+      const response = await fetch(`/api/provider/com-status?domain=${encodeURIComponent(selectedDomain)}`);
+      const payload = (await response.json()) as ComStatusSnapshot & { error?: string; details?: string };
+      if (!response.ok) throw new Error(payload.details || payload.error || "No se pudo comprobar el .com");
+      setComStatus(payload);
+    } catch (error: unknown) {
+      setComStatus(null);
+      setComStatusError(getErrorDetails(error));
+    } finally {
+      setComStatusLoading(false);
     }
   }, [selectedDomain]);
 
@@ -899,6 +946,15 @@ export default function IntranetPage() {
                 ) : null}
                 {selectedDomain ? (
                   <button
+                    onClick={() => void checkComStatus()}
+                    disabled={comStatusLoading}
+                    className="rounded-md border border-green-300 px-3 py-1 text-xs text-green-700 hover:bg-green-50 disabled:opacity-50"
+                  >
+                    {comStatusLoading ? "Comprobando .com..." : "WHOIS / Disponibilidad .com"}
+                  </button>
+                ) : null}
+                {selectedDomain ? (
+                  <button
                     onClick={() => void refreshProviderDns()}
                     disabled={providerLoading}
                     className="rounded-md border border-neutral-300 px-3 py-1 text-xs hover:bg-neutral-100 disabled:opacity-50"
@@ -922,6 +978,9 @@ export default function IntranetPage() {
                 {publicDnsError ? (
                   <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">{publicDnsError}</p>
                 ) : null}
+                {comStatusError ? (
+                  <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-700">{comStatusError}</p>
+                ) : null}
                 {publicDns ? (
                   <div className="rounded-md border border-neutral-200 bg-white p-3">
                     <h3 className="mb-2 text-sm font-semibold text-neutral-800">DNS pública</h3>
@@ -938,6 +997,41 @@ export default function IntranetPage() {
                           <p className="text-neutral-600">{values.length ? values.slice(0, 3).join(" | ") : "-"}</p>
                         </div>
                       ))}
+                    </div>
+                  </div>
+                ) : null}
+                {comStatus ? (
+                  <div className="rounded-md border border-green-200 bg-white p-3">
+                    <h3 className="mb-2 text-sm font-semibold text-neutral-800">Estado .com + WHOIS</h3>
+                    <div className="grid gap-2 md:grid-cols-2">
+                      <div className="rounded border border-neutral-200 px-2 py-1 text-xs">
+                        <p className="font-medium text-neutral-700">Dominio .com</p>
+                        <p className="text-neutral-700">{comStatus.comDomain}</p>
+                      </div>
+                      <div className="rounded border border-neutral-200 px-2 py-1 text-xs">
+                        <p className="font-medium text-neutral-700">Disponibilidad inferida</p>
+                        <p className={comStatus.availability.available ? "text-green-700 font-semibold" : "text-red-700 font-semibold"}>
+                          {comStatus.availability.available ? "Disponible" : "No disponible"}
+                        </p>
+                        <p className="text-neutral-500">Confianza: {comStatus.availability.confidence}</p>
+                      </div>
+                      <div className="rounded border border-neutral-200 px-2 py-1 text-xs">
+                        <p className="font-medium text-neutral-700">WHOIS</p>
+                        <p className="text-neutral-700">{comStatus.whois.found ? "Encontrado" : "No encontrado"}</p>
+                        <p className="text-neutral-500">Registrar: {comStatus.whois.registrar || "-"}</p>
+                      </div>
+                      <div className="rounded border border-neutral-200 px-2 py-1 text-xs">
+                        <p className="font-medium text-neutral-700">DNS pública .com</p>
+                        <p className="text-neutral-700">{comStatus.dns.hasAnyRecord ? "Tiene DNS" : "Sin DNS"}</p>
+                      </div>
+                      <div className="rounded border border-neutral-200 px-2 py-1 text-xs">
+                        <p className="font-medium text-neutral-700">Creación</p>
+                        <p className="text-neutral-700">{comStatus.whois.createdAt || "-"}</p>
+                      </div>
+                      <div className="rounded border border-neutral-200 px-2 py-1 text-xs">
+                        <p className="font-medium text-neutral-700">Expiración</p>
+                        <p className="text-neutral-700">{comStatus.whois.expiresAt || "-"}</p>
+                      </div>
                     </div>
                   </div>
                 ) : null}

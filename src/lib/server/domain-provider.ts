@@ -38,7 +38,7 @@ function getConfig() {
     throw new Error("Falta DOMAIN_PROVIDER_BASE_URL en el servidor.");
   }
 
-  const headerName = getEnv("DOMAIN_PROVIDER_API_KEY_HEADER", "X-API-Key");
+  const headerName = getEnv("DOMAIN_PROVIDER_API_KEY_HEADER", "apikey");
   const headerValue = getEnv("DOMAIN_PROVIDER_API_KEY_VALUE", apiKey);
 
   return {
@@ -79,9 +79,6 @@ async function providerRequest<T = unknown>(options: RequestOptions): Promise<T>
   const headers: HeadersInit = {
     Accept: "application/json",
     [config.headerName]: config.headerValue,
-    "X-API-Key": config.headerValue,
-    "API-Key": config.headerValue,
-    apikey: config.headerValue,
   };
 
   const init: RequestInit = {
@@ -174,23 +171,27 @@ function parseDnsList(payload: unknown): ProviderDnsRecord[] {
 export async function fetchProviderDomain(domain: string): Promise<ProviderDomainSnapshot> {
   const config = getConfig();
   const safeDomain = domain.trim().toLowerCase();
+  const infoPayload = await providerRequest({
+    method: "POST",
+    pathTemplate: config.domainInfoPath,
+    body: { data: { domain: safeDomain } },
+  });
 
-  const [infoPayload, dnsPayload] = await Promise.all([
-    providerRequest({
-      method: "POST",
-      pathTemplate: config.domainInfoPath,
-      body: { domain: safeDomain },
-    }),
-    providerRequest({
+  let dnsPayload: unknown = { data: { records: [] } };
+  try {
+    dnsPayload = await providerRequest({
       method: "POST",
       pathTemplate: config.dnsListPath,
-      body: { domain: safeDomain },
-    }),
-  ]);
+      body: { data: { domain: safeDomain } },
+    });
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : String(error);
+    dnsPayload = { data: { records: [] }, dns_error: message };
+  }
 
   return {
     domain: safeDomain,
-    info: (unwrapData(infoPayload) as Record<string, unknown>) || {},
+    info: ((unwrapData(infoPayload) as Record<string, unknown>) || {}) as Record<string, unknown>,
     dnsRecords: parseDnsList(dnsPayload),
   };
 }
@@ -204,11 +205,17 @@ export async function createProviderDnsRecord(
     method: "POST",
     pathTemplate: config.dnsCreatePath,
     body: {
-      domain: domain.trim().toLowerCase(),
-      type: input.type.trim().toUpperCase(),
-      name: input.name.trim(),
-      value: input.value.trim(),
-      ttl: input.ttl ?? undefined,
+      data: {
+        domain: domain.trim().toLowerCase(),
+        records: [
+          {
+            type: input.type.trim().toUpperCase(),
+            host: input.name.trim(),
+            value: input.value.trim(),
+            ...(input.ttl !== undefined && input.ttl !== null ? { ttl: input.ttl } : {}),
+          },
+        ],
+      },
     },
   });
 }
@@ -223,12 +230,18 @@ export async function updateProviderDnsRecord(
     method: "POST",
     pathTemplate: config.dnsUpdatePath,
     body: {
-      domain: domain.trim().toLowerCase(),
-      id: recordId.trim(),
-      ...(input.type ? { type: input.type.trim().toUpperCase() } : {}),
-      ...(input.name ? { name: input.name.trim() } : {}),
-      ...(input.value ? { value: input.value.trim() } : {}),
-      ...(input.ttl !== undefined ? { ttl: input.ttl } : {}),
+      data: {
+        domain: domain.trim().toLowerCase(),
+        records: [
+          {
+            id: Number(recordId) || recordId.trim(),
+            ...(input.type ? { type: input.type.trim().toUpperCase() } : {}),
+            ...(input.name ? { host: input.name.trim() } : {}),
+            ...(input.value ? { value: input.value.trim() } : {}),
+            ...(input.ttl !== undefined && input.ttl !== null ? { ttl: input.ttl } : {}),
+          },
+        ],
+      },
     },
   });
 }
@@ -238,6 +251,11 @@ export async function deleteProviderDnsRecord(domain: string, recordId: string) 
   return providerRequest({
     method: "POST",
     pathTemplate: config.dnsDeletePath,
-    body: { domain: domain.trim().toLowerCase(), id: recordId.trim() },
+    body: {
+      data: {
+        domain: domain.trim().toLowerCase(),
+        records: [Number(recordId) || recordId.trim()],
+      },
+    },
   });
 }

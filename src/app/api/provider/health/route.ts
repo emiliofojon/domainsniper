@@ -9,9 +9,11 @@ function getBaseUrl(): string {
 
 export async function GET() {
   const baseUrl = getBaseUrl();
-  const hasApiKey = Boolean(process.env.DOMAIN_PROVIDER_API_KEY?.trim());
-  const header = process.env.DOMAIN_PROVIDER_API_KEY_HEADER?.trim() || "";
-  const hasHeaderValue = Boolean(process.env.DOMAIN_PROVIDER_API_KEY_VALUE?.trim());
+  const apiKey = process.env.DOMAIN_PROVIDER_API_KEY?.trim() || "";
+  const headerValue = process.env.DOMAIN_PROVIDER_API_KEY_VALUE?.trim() || apiKey;
+  const hasApiKey = Boolean(apiKey);
+  const header = process.env.DOMAIN_PROVIDER_API_KEY_HEADER?.trim() || "apikey";
+  const hasHeaderValue = Boolean(headerValue);
 
   if (!baseUrl) {
     return NextResponse.json(

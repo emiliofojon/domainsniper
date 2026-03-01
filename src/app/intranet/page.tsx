@@ -226,6 +226,8 @@ export default function IntranetPage() {
   const [totalMatches, setTotalMatches] = useState<number | null>(null);
   const [syncInfo, setSyncInfo] = useState<SyncInfo | null>(null);
   const [comCheckInfo, setComCheckInfo] = useState<ComCheckInfo | null>(null);
+  const [statusRefreshing, setStatusRefreshing] = useState(false);
+  const [statusRefreshedAt, setStatusRefreshedAt] = useState<string | null>(null);
   const [analytics, setAnalytics] = useState<DashboardAnalytics | null>(null);
   const [expandedRows, setExpandedRows] = useState<Set<string>>(new Set());
   const [selectedDomain, setSelectedDomain] = useState<string | null>(null);
@@ -319,7 +321,10 @@ export default function IntranetPage() {
 
   const loadSyncInfo = useCallback(async () => {
     try {
-      const response = await fetch("/api/domains/sync");
+      const response = await fetch(`/api/domains/sync?t=${Date.now()}`, {
+        cache: "no-store",
+        headers: { "Cache-Control": "no-cache" },
+      });
       if (!response.ok) return;
       const payload = (await response.json()) as SyncInfo;
       setSyncInfo(payload);
@@ -338,6 +343,16 @@ export default function IntranetPage() {
       // ignore
     }
   }, []);
+
+  const refreshLiveStatus = useCallback(async () => {
+    setStatusRefreshing(true);
+    try {
+      await Promise.all([loadSyncInfo(), loadComCheckInfo()]);
+      setStatusRefreshedAt(new Date().toISOString());
+    } finally {
+      setStatusRefreshing(false);
+    }
+  }, [loadComCheckInfo, loadSyncInfo]);
 
   const syncNow = useCallback(async () => {
     setDomainsError(null);
@@ -713,6 +728,28 @@ export default function IntranetPage() {
               {comCheckInfo.lastError ? ` Error: ${comCheckInfo.lastError}` : ""}
             </p>
           ) : null}
+
+          <section className="rounded-md border border-neutral-200 bg-neutral-50 p-3 text-sm text-neutral-700">
+            <div className="mb-2 flex items-center justify-between gap-2">
+              <p className="font-medium text-neutral-900">Estado Soinda en vivo</p>
+              <button
+                onClick={() => void refreshLiveStatus()}
+                disabled={statusRefreshing}
+                className="rounded border border-neutral-300 px-2 py-1 text-xs hover:bg-neutral-100 disabled:opacity-50"
+              >
+                {statusRefreshing ? "Refrescando..." : "Refrescar estado"}
+              </button>
+            </div>
+            <p>
+              Última sync API: {syncInfo?.lastSyncAt ? new Date(syncInfo.lastSyncAt).toLocaleString() : "-"}{" "}
+              ({syncInfo?.lastSyncAt || "sin dato UTC"})
+            </p>
+            <p>
+              Cursor `source_created_at_max`: {syncInfo?.sourceCreatedAtMax ? new Date(syncInfo.sourceCreatedAtMax).toLocaleString() : "-"}{" "}
+              ({syncInfo?.sourceCreatedAtMax || "sin dato UTC"})
+            </p>
+            <p>Último refresco manual de estado: {statusRefreshedAt ? new Date(statusRefreshedAt).toLocaleString() : "-"}</p>
+          </section>
 
           <div className="flex items-center gap-2">
             <button
